@@ -1,9 +1,12 @@
-﻿﻿﻿package main
+﻿package main
 
 import (
+	"conf-merge/pkg/changelog"
 	"conf-merge/pkg/color"
 	"conf-merge/pkg/diff"
+	"conf-merge/pkg/drift"
 	"conf-merge/pkg/env"
+	gitpkg "conf-merge/pkg/git"
 	mergepkg "conf-merge/pkg/merge"
 	"conf-merge/pkg/model"
 	"conf-merge/pkg/parser"
@@ -19,6 +22,9 @@ const (
 	ExitOK          = 0
 	ExitHasConflict = 1
 	ExitParseError  = 2
+	ExitDriftInfo   = 1
+	ExitDriftWarn   = 2
+	ExitDriftCrit   = 3
 )
 
 type GlobalOptions struct {
@@ -55,6 +61,10 @@ func main() {
 		exitCode, err = runConvert(remaining, globals)
 	case "validate":
 		exitCode, err = runValidate(remaining, globals)
+	case "history":
+		exitCode, err = runHistory(remaining, globals)
+	case "drift":
+		exitCode, err = runDrift(remaining, globals)
 	case "-h", "--help", "help":
 		printUsage()
 		exitCode = ExitOK
@@ -561,6 +571,32 @@ COMMANDS:
   validate <file> --schema=<schema.json>
            Validate config file against JSON Schema.
 
+  history  <repo-path> <config-file> [--limit=N] [--changelog] [--since=...] [--until=...]
+           Track config file change history from Git, show semantic diff per commit.
+           Options:
+             --limit=N            Show last N commits (default: 20)
+             --changelog          Output as Markdown changelog grouped by key prefix
+             --since=<time>       Only commits since (ISO 8601 or relative: 7d/2w/1m)
+             --until=<time>       Only commits until (ISO 8601 or relative)
+             --title=<text>       Custom title for Markdown changelog
+
+  drift    <expected-config> <actual-config> [--format=text|json] [--critical-keys=...]
+           Detect configuration drift with severity classification.
+           Severity rules:
+             type-changed  → critical (structurally destructive)
+             value-removed → warning  (may cause feature loss)
+             value-added   → info     (extra config, backward compatible)
+             value-modified→ warning  (or critical if in --critical-keys)
+           Options:
+             --format=text|json     Output format (default: text with color)
+             --critical-keys=a,b    Comma-separated critical key paths
+             --critical-key=path    Single critical key path (repeatable)
+           Exit codes:
+             0  no drift
+             1  info-level drift
+             2  warning-level drift
+             3  critical-level drift
+
 GLOBAL OPTIONS:
   --format=<name>           Force input format (json/yaml/toml/ini/properties/env)
   --output-format=<name>    Force output format
@@ -574,9 +610,10 @@ GLOBAL OPTIONS:
   --exclude=<pattern>       Exclude files matching glob pattern (batch mode, repeatable)
 
 EXIT CODES:
-  0  Success, no conflicts
-  1  Success, but has conflicts/differences
-  2  Parse error or usage error`)
+  0  Success, no conflicts/drift
+  1  Success, but has conflicts/differences or info-level drift
+  2  Warning-level drift or parse error
+  3  Critical-level drift`)
 }
 
 type FileDiffResult struct {
@@ -751,4 +788,245 @@ func collectFiles(root string, include, exclude []string) ([]string, error) {
 		return nil
 	})
 	return result, err
+}
+
+func runHistory(args []string, g *GlobalOptions) (int, error) {
+	if len(args) < 2 {
+		return ExitParseError, fmt.Errorf("history requires: <repo-path> <config-file-path> [options]")
+	}
+	repoPath := args[0]
+	configPath := args[1]
+	limit := 20
+	enableChangelog := false
+	since := ""
+	until := ""
+	changelogTitle := ""
+
+	i := 2
+	for i < len(args) {
+		arg := args[i]
+		switch {
+		case strings.HasPrefix(arg, "--limit="):
+			val := strings.TrimPrefix(arg, "--limit=")
+			var n int
+			_, err := fmt.Sscanf(val, "%d", &n)
+			if err != nil {
+				return ExitParseError, fmt.Errorf("invalid --limit value: %s", val)
+			}
+			limit = n
+			i++
+		case arg == "--limit":
+			if i+1 >= len(args) {
+				return ExitParseError, fmt.Errorf("--limit requires a value")
+			}
+			var n int
+			_, err := fmt.Sscanf(args[i+1], "%d", &n)
+			if err != nil {
+				return ExitParseError, fmt.Errorf("invalid --limit value: %s", args[i+1])
+			}
+			limit = n
+			i += 2
+		case arg == "--changelog":
+			enableChangelog = true
+			i++
+		case strings.HasPrefix(arg, "--since="):
+			raw := strings.TrimPrefix(arg, "--since=")
+			parsed, err := gitpkg.ParseRelativeTime(raw)
+			if err != nil {
+				return ExitParseError, err
+			}
+			since = parsed
+			i++
+		case arg == "--since":
+			if i+1 >= len(args) {
+				return ExitParseError, fmt.Errorf("--since requires a value")
+			}
+			parsed, err := gitpkg.ParseRelativeTime(args[i+1])
+			if err != nil {
+				return ExitParseError, err
+			}
+			since = parsed
+			i += 2
+		case strings.HasPrefix(arg, "--until="):
+			raw := strings.TrimPrefix(arg, "--until=")
+			parsed, err := gitpkg.ParseRelativeTime(raw)
+			if err != nil {
+				return ExitParseError, err
+			}
+			until = parsed
+			i++
+		case arg == "--until":
+			if i+1 >= len(args) {
+				return ExitParseError, fmt.Errorf("--until requires a value")
+			}
+			parsed, err := gitpkg.ParseRelativeTime(args[i+1])
+			if err != nil {
+				return ExitParseError, err
+			}
+			until = parsed
+			i += 2
+		case strings.HasPrefix(arg, "--title="):
+			changelogTitle = strings.TrimPrefix(arg, "--title=")
+			i++
+		default:
+			i++
+		}
+	}
+
+	versions, err := gitpkg.GetFileVersions(repoPath, configPath, limit, since, until)
+	if err != nil {
+		return ExitParseError, err
+	}
+
+	if len(versions) < 2 {
+		if !g.Quiet {
+			fmt.Printf("Not enough history for %s (found %d version(s), need at least 2)\n", configPath, len(versions))
+		}
+		return ExitOK, nil
+	}
+
+	var entries []changelog.HistoryEntry
+	diffOpts := &diff.DiffOptions{ArrayKeyMap: g.ArrayKeys}
+
+	for i := len(versions) - 1; i >= 1; i-- {
+		older := versions[i-1]
+		newer := versions[i]
+
+		valOld, _, errOld := parser.ParseFile(older.Content, configPath, g.Format)
+		valNew, _, errNew := parser.ParseFile(newer.Content, configPath, g.Format)
+		if errOld != nil || errNew != nil {
+			continue
+		}
+		if g.ExpandEnv {
+			valOld, _ = env.ExpandTree(valOld)
+			valNew, _ = env.ExpandTree(valNew)
+		}
+		d := diff.ComputeDiff(valOld, valNew, diffOpts)
+		if !d.HasDifferences() {
+			continue
+		}
+		entry := changelog.HistoryEntry{
+			Commit:  newer.Commit,
+			Changes: make([]changelog.ChangeKey, 0, len(d.Items)),
+		}
+		for _, item := range d.Items {
+			entry.Changes = append(entry.Changes, changelog.ChangeKey{
+				Path:       item.Path,
+				ChangeType: item.Type,
+				OldValue:   item.OldValue,
+				NewValue:   item.NewValue,
+				OldType:    item.OldType,
+				NewType:    item.NewType,
+			})
+		}
+		entries = append(entries, entry)
+	}
+
+	if !g.Quiet {
+		if enableChangelog {
+			fmt.Print(changelog.FormatMarkdownChangelog(entries, changelogTitle, since, until))
+		} else {
+			fmt.Print(changelog.FormatSimpleHistory(entries))
+		}
+	}
+	return ExitOK, nil
+}
+
+func runDrift(args []string, g *GlobalOptions) (int, error) {
+	if len(args) < 2 {
+		return ExitParseError, fmt.Errorf("drift requires: <expected-config> <actual-config> [options]")
+	}
+	expectedFile := args[0]
+	actualFile := args[1]
+	format := "text"
+	var criticalKeys []string
+
+	i := 2
+	for i < len(args) {
+		arg := args[i]
+		switch {
+		case strings.HasPrefix(arg, "--format="):
+			format = strings.ToLower(strings.TrimPrefix(arg, "--format="))
+			if format != "text" && format != "json" {
+				return ExitParseError, fmt.Errorf("invalid --format value: %s (must be text or json)", format)
+			}
+			i++
+		case arg == "--format":
+			if i+1 >= len(args) {
+				return ExitParseError, fmt.Errorf("--format requires a value")
+			}
+			format = strings.ToLower(args[i+1])
+			if format != "text" && format != "json" {
+				return ExitParseError, fmt.Errorf("invalid --format value: %s (must be text or json)", format)
+			}
+			i += 2
+		case strings.HasPrefix(arg, "--critical-keys="):
+			raw := strings.TrimPrefix(arg, "--critical-keys=")
+			for _, k := range strings.Split(raw, ",") {
+				k = strings.TrimSpace(k)
+				if k != "" {
+					criticalKeys = append(criticalKeys, k)
+				}
+			}
+			i++
+		case arg == "--critical-keys":
+			if i+1 >= len(args) {
+				return ExitParseError, fmt.Errorf("--critical-keys requires a value")
+			}
+			for _, k := range strings.Split(args[i+1], ",") {
+				k = strings.TrimSpace(k)
+				if k != "" {
+					criticalKeys = append(criticalKeys, k)
+				}
+			}
+			i += 2
+		case strings.HasPrefix(arg, "--critical-key="):
+			k := strings.TrimSpace(strings.TrimPrefix(arg, "--critical-key="))
+			if k != "" {
+				criticalKeys = append(criticalKeys, k)
+			}
+			i++
+		case arg == "--critical-key":
+			if i+1 >= len(args) {
+				return ExitParseError, fmt.Errorf("--critical-key requires a value")
+			}
+			criticalKeys = append(criticalKeys, strings.TrimSpace(args[i+1]))
+			i += 2
+		default:
+			i++
+		}
+	}
+
+	valExp, _, err := loadAndParse(expectedFile, g)
+	if err != nil {
+		return ExitParseError, err
+	}
+	valAct, _, err := loadAndParse(actualFile, g)
+	if err != nil {
+		return ExitParseError, err
+	}
+	if g.ExpandEnv {
+		valExp, _ = env.ExpandTree(valExp)
+		valAct, _ = env.ExpandTree(valAct)
+	}
+
+	dopts := &drift.DriftOptions{
+		CriticalKeys: criticalKeys,
+		ArrayKeyMap:  g.ArrayKeys,
+	}
+	result := drift.ComputeDrift(valExp, valAct, dopts)
+
+	if !g.Quiet {
+		switch format {
+		case "json":
+			jsonStr, err := result.FormatJSON()
+			if err != nil {
+				return ExitParseError, fmt.Errorf("failed to format JSON: %v", err)
+			}
+			fmt.Println(jsonStr)
+		default:
+			fmt.Print(result.FormatText(g.Verbose))
+		}
+	}
+	return result.ExitCode(), nil
 }
