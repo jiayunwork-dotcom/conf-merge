@@ -1,0 +1,26 @@
+app:
+  name: myapp
+  version: "1.0"
+
+{{block "header"}}
+# Default header
+header:
+  enabled: false
+{{end}}
+
+database:
+  host: {{.database.host}}
+  port: {{.database.port}}
+
+{{block "body"}}
+# Default body
+features:
+  - auth
+  - logging
+{{end}}
+
+{{block "footer"}}
+# Default footer
+footer:
+  copyright: "2024"
+{{end}}

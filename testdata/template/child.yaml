@@ -1,0 +1,15 @@
+{{extends "base.yaml"}}
+
+{{override "header"}}
+header:
+  enabled: true
+  title: "Production App"
+{{end}}
+
+{{override "body"}}
+features:
+  - auth
+  - logging
+  - monitoring
+  - caching
+{{end}}

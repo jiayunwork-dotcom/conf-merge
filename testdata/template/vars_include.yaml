@@ -1,0 +1,11 @@
+app_name: testapp
+
+database:
+  host: db.example.com
+  port: 5432
+  name: mydb
+  user: admin
+
+cache:
+  type: redis
+  ttl: 600

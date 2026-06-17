@@ -1,6 +1,7 @@
-﻿﻿package main
+﻿package main
 
 import (
+	"bufio"
 	"conf-merge/pkg/changelog"
 	"conf-merge/pkg/color"
 	"conf-merge/pkg/diff"
@@ -606,28 +607,41 @@ COMMANDS:
              2  warning-level drift
              3  critical-level drift
 
-  render   <template-file> [-var <var-file>]... [-o output]
+  render   <template-file> [-var <var-file>]... [-o output] [--debug]
            Render a template file with variables to generate final config.
            Template syntax:
              {{.var.path}}     - simple variable substitution
              {{if .cond}}...{{end}}  - conditional block
              {{range .arr}}...{{end}} - loop over array
              In range body: {{.}} for current item, {{.field}} for item fields
+           Template inheritance:
+             {{extends "base.yaml"}}          - inherit from base template (must be first line)
+             {{block "name"}}...{{end}}        - define overridable block in base template
+             {{override "name"}}...{{end}}     - override block content in child template
+           Fragment reuse:
+             {{include "fragment.yaml"}}       - include and render another template file
+                                  (relative to current template, max 10 levels, cycle-detected)
            Options:
              -var <file>         Variable file (YAML/JSON/TOML), repeatable, later overrides earlier
              -o, --output <file> Output file (default: stdout)
+             --debug             Enable debug output (variable substitutions, condition results, loop iterations)
            Exit codes:
              0  success
              2  parse/render error
 
   template-diff <template-file> <name1>=<varfile1> <name2>=<varfile2>...
-                [--array-key=<path>=<key>]
+                [--array-key=<path>=<key>] [--interactive]
            Render template with multiple variable sets and show diff matrix.
            Arguments:
              template-file       The template file to render
              name=varfile        Environment name and variable file pairs (at least 2)
            Options:
              --array-key=<path>=<key>  Array matching key for semantic diff
+             --interactive             Enter interactive diff exploration mode
+           Interactive mode commands:
+             n / next / <empty>   Switch to next environment pair
+             q / quit / exit      Exit interactive mode
+             <prefix>             Filter diff by key path prefix (e.g. "database")
            Output format: Matrix showing differences per environment pair,
            grouped by key prefix (e.g. "database.*", "cache.*").
            Exit codes:
@@ -1080,12 +1094,13 @@ func runDrift(args []string, g *GlobalOptions) (int, error) {
 
 func runRender(args []string, g *GlobalOptions) (int, error) {
 	if len(args) < 1 {
-		return ExitParseError, fmt.Errorf("render requires: <template-file> [-var <var-file>]... [-o output]")
+		return ExitParseError, fmt.Errorf("render requires: <template-file> [-var <var-file>]... [-o output] [--debug]")
 	}
 
 	templateFile := ""
 	varFiles := []string{}
 	output := ""
+	debug := false
 	i := 0
 
 	for i < len(args) {
@@ -1109,6 +1124,9 @@ func runRender(args []string, g *GlobalOptions) (int, error) {
 		case strings.HasPrefix(arg, "--output="):
 			output = strings.TrimPrefix(arg, "--output=")
 			i++
+		case arg == "--debug":
+			debug = true
+			i++
 		default:
 			if templateFile == "" {
 				templateFile = arg
@@ -1121,17 +1139,9 @@ func runRender(args []string, g *GlobalOptions) (int, error) {
 		return ExitParseError, fmt.Errorf("render requires a template file")
 	}
 
-	templateContent, err := os.ReadFile(templateFile)
+	tmpl, err := templatepkg.LoadTemplateFile(templateFile)
 	if err != nil {
-		return ExitParseError, fmt.Errorf("cannot read template %s: %v", templateFile, err)
-	}
-
-	tmpl, parseErrs := templatepkg.Parse(string(templateContent))
-	if len(parseErrs) > 0 {
-		for _, pe := range parseErrs {
-			fmt.Fprintf(os.Stderr, "  %s:%d:%d: %s\n", templateFile, pe.Line, pe.Column, pe.Message)
-		}
-		return ExitTemplateErr, fmt.Errorf("template has %d syntax error(s)", len(parseErrs))
+		return ExitTemplateErr, err
 	}
 
 	var mergedVars *model.Value
@@ -1152,9 +1162,19 @@ func runRender(args []string, g *GlobalOptions) (int, error) {
 		mergedVars = model.NewMapValue()
 	}
 
-	result, err := tmpl.Render(mergedVars)
-	if err != nil {
-		return ExitTemplateErr, err
+	var result string
+	if debug {
+		var dbg *templatepkg.DebugInfo
+		result, dbg, err = tmpl.RenderDebug(mergedVars)
+		if err != nil {
+			return ExitTemplateErr, err
+		}
+		printDebugInfo(dbg)
+	} else {
+		result, err = tmpl.Render(mergedVars)
+		if err != nil {
+			return ExitTemplateErr, err
+		}
 	}
 
 	if output != "" {
@@ -1172,13 +1192,56 @@ func runRender(args []string, g *GlobalOptions) (int, error) {
 	return ExitOK, nil
 }
 
+func printDebugInfo(dbg *templatepkg.DebugInfo) {
+	if dbg == nil {
+		return
+	}
+	gray := color.Gray
+	if len(dbg.Replacements) > 0 {
+		fmt.Fprintln(os.Stderr, gray("=== Variable Replacements ==="))
+		for _, r := range dbg.Replacements {
+			fmt.Fprintf(os.Stderr, gray("  line %d, col %d: %s -> %q\n"), r.Line, r.Column, r.Path, r.After)
+		}
+	}
+	if len(dbg.Conditions) > 0 {
+		fmt.Fprintln(os.Stderr, gray("=== Condition Results ==="))
+		for _, c := range dbg.Conditions {
+			resultStr := "FALSE"
+			if c.Result {
+				resultStr = "TRUE"
+			}
+			fmt.Fprintf(os.Stderr, gray("  line %d, col %d: %s -> %s (%s)\n"), c.Line, c.Column, c.Path, resultStr, c.Reason)
+		}
+	}
+	if len(dbg.Loops) > 0 {
+		fmt.Fprintln(os.Stderr, gray("=== Loop Iterations ==="))
+		for _, l := range dbg.Loops {
+			fmt.Fprintf(os.Stderr, gray("  line %d, col %d: %s -> %d iteration(s)\n"), l.Line, l.Column, l.Path, l.Iterations)
+		}
+	}
+}
+
 func runTemplateDiff(args []string, g *GlobalOptions) (int, error) {
 	if len(args) < 3 {
+		return ExitParseError, fmt.Errorf("template-diff requires: <template-file> <name1>=<varfile1> <name2>=<varfile2>... [--interactive]")
+	}
+
+	interactive := false
+	remainingArgs := []string{}
+	for _, arg := range args {
+		if arg == "--interactive" {
+			interactive = true
+		} else {
+			remainingArgs = append(remainingArgs, arg)
+		}
+	}
+
+	if len(remainingArgs) < 3 {
 		return ExitParseError, fmt.Errorf("template-diff requires: <template-file> <name1>=<varfile1> <name2>=<varfile2>...")
 	}
 
-	templateFile := args[0]
-	envPairs := args[1:]
+	templateFile := remainingArgs[0]
+	envPairs := remainingArgs[1:]
 
 	envs := make(map[string]string)
 	envOrder := []string{}
@@ -1202,17 +1265,9 @@ func runTemplateDiff(args []string, g *GlobalOptions) (int, error) {
 		return ExitParseError, fmt.Errorf("template-diff requires at least 2 environments")
 	}
 
-	templateContent, err := os.ReadFile(templateFile)
+	tmpl, err := templatepkg.LoadTemplateFile(templateFile)
 	if err != nil {
-		return ExitParseError, fmt.Errorf("cannot read template %s: %v", templateFile, err)
-	}
-
-	tmpl, parseErrs := templatepkg.Parse(string(templateContent))
-	if len(parseErrs) > 0 {
-		for _, pe := range parseErrs {
-			fmt.Fprintf(os.Stderr, "  %s:%d:%d: %s\n", templateFile, pe.Line, pe.Column, pe.Message)
-		}
-		return ExitTemplateErr, fmt.Errorf("template has %d syntax error(s)", len(parseErrs))
+		return ExitTemplateErr, err
 	}
 
 	rendered := make(map[string]*model.Value)
@@ -1242,8 +1297,13 @@ func runTemplateDiff(args []string, g *GlobalOptions) (int, error) {
 
 	_ = renderedStr
 
-	hasDiff := false
 	opts := &diff.DiffOptions{ArrayKeyMap: g.ArrayKeys}
+
+	if interactive {
+		return runInteractiveTemplateDiff(envOrder, rendered, opts, g)
+	}
+
+	hasDiff := false
 
 	fmt.Println("=== Template Diff Matrix ===")
 	fmt.Println()
@@ -1287,6 +1347,125 @@ func runTemplateDiff(args []string, g *GlobalOptions) (int, error) {
 	}
 
 	if hasDiff {
+		return ExitHasConflict, nil
+	}
+	return ExitOK, nil
+}
+
+func runInteractiveTemplateDiff(envOrder []string, rendered map[string]*model.Value, opts *diff.DiffOptions, g *GlobalOptions) (int, error) {
+	reader := bufio.NewReader(os.Stdin)
+
+	type envPair struct {
+		a, b string
+	}
+	pairs := []envPair{}
+	for i := 0; i < len(envOrder); i++ {
+		for j := i + 1; j < len(envOrder); j++ {
+			pairs = append(pairs, envPair{envOrder[i], envOrder[j]})
+		}
+	}
+
+	if len(pairs) == 0 {
+		return ExitOK, nil
+	}
+
+	fmt.Println("=== Interactive Template Diff ===")
+	fmt.Println()
+	fmt.Println("Available environments:")
+	for idx, name := range envOrder {
+		fmt.Printf("  %d) %s\n", idx+1, name)
+	}
+	fmt.Println()
+	fmt.Printf("There are %d environment pairs to compare.\n", len(pairs))
+	fmt.Println("Commands: 'n' = next pair, 'q' = quit, or type a key path prefix to filter")
+	fmt.Println()
+
+	pairIdx := 0
+	filterPrefix := ""
+
+	for {
+		curPair := pairs[pairIdx]
+		dres := diff.ComputeDiff(rendered[curPair.a], rendered[curPair.b], opts)
+
+		filteredItems := dres.Items
+		if filterPrefix != "" {
+			filteredItems = []diff.DiffItem{}
+			for _, item := range dres.Items {
+				if strings.HasPrefix(item.Path, filterPrefix) {
+					filteredItems = append(filteredItems, item)
+				}
+			}
+		}
+
+		fmt.Printf("\n--- Pair %d/%d: %s vs %s ---\n", pairIdx+1, len(pairs),
+			color.Bold(curPair.a), color.Bold(curPair.b))
+		if filterPrefix != "" {
+			fmt.Printf("Filter: %q (%d/%d matches)\n", filterPrefix, len(filteredItems), len(dres.Items))
+		}
+
+		if len(filteredItems) == 0 {
+			fmt.Println("(no differences)")
+		} else {
+			filteredResult := &diff.DiffResult{
+				Items: filteredItems,
+				Total: len(filteredItems),
+			}
+			for _, item := range filteredItems {
+				switch item.Type {
+				case diff.DiffAdded:
+					filteredResult.Added++
+				case diff.DiffRemoved:
+					filteredResult.Removed++
+				case diff.DiffModified:
+					filteredResult.Modified++
+				case diff.DiffTypeChanged:
+					filteredResult.TypeChg++
+				}
+			}
+			fmt.Println(filteredResult.Format(true))
+		}
+
+		fmt.Print("\n[n=next, q=quit, or prefix filter]: ")
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			return ExitParseError, fmt.Errorf("failed to read input: %v", err)
+		}
+		input = strings.TrimSpace(input)
+
+		switch strings.ToLower(input) {
+		case "q", "quit", "exit":
+			hasAnyDiff := false
+			for _, p := range pairs {
+				d := diff.ComputeDiff(rendered[p.a], rendered[p.b], opts)
+				if d.HasDifferences() {
+					hasAnyDiff = true
+					break
+				}
+			}
+			if hasAnyDiff {
+				return ExitHasConflict, nil
+			}
+			return ExitOK, nil
+		case "n", "next", "":
+			pairIdx = (pairIdx + 1) % len(pairs)
+			filterPrefix = ""
+		default:
+			filterPrefix = input
+		}
+	}
+
+	hasAnyDiff := false
+	for _, p := range pairs {
+		d := diff.ComputeDiff(rendered[p.a], rendered[p.b], opts)
+		if d.HasDifferences() {
+			hasAnyDiff = true
+			break
+		}
+	}
+	if hasAnyDiff {
 		return ExitHasConflict, nil
 	}
 	return ExitOK, nil
@@ -1343,20 +1522,9 @@ func runTemplateValidate(args []string, g *GlobalOptions) (int, error) {
 		return ExitParseError, fmt.Errorf("template-validate requires a template file")
 	}
 
-	templateContent, err := os.ReadFile(templateFile)
+	tmpl, err := templatepkg.LoadTemplateFile(templateFile)
 	if err != nil {
-		return ExitParseError, fmt.Errorf("cannot read template %s: %v", templateFile, err)
-	}
-
-	tmpl, parseErrs := templatepkg.Parse(string(templateContent))
-	if len(parseErrs) > 0 {
-		if !g.Quiet {
-			fmt.Printf("Template has %d syntax error(s):\n", len(parseErrs))
-			for _, pe := range parseErrs {
-				fmt.Printf("  line %d, col %d: %s\n", pe.Line, pe.Column, pe.Message)
-			}
-		}
-		return ExitTemplateErr, nil
+		return ExitTemplateErr, err
 	}
 
 	var mergedVars *model.Value

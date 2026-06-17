@@ -1,0 +1,8 @@
+app:
+  name: {{.app_name}}
+
+{{include "db_fragment.yaml"}}
+
+cache:
+  type: {{.cache.type}}
+  ttl: {{.cache.ttl}}
