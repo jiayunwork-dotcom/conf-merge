@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"conf-merge/pkg/color"
@@ -10,7 +10,6 @@ import (
 	"conf-merge/pkg/schema"
 	"conf-merge/pkg/writer"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -220,7 +219,7 @@ func runMerge(args []string, g *GlobalOptions) (int, error) {
 		return ExitParseError, err
 	}
 	if output != "" {
-		err = ioutil.WriteFile(output, []byte(outputStr), 0644)
+		err = os.WriteFile(output, []byte(outputStr), 0644)
 		if err != nil {
 			return ExitParseError, err
 		}
@@ -339,7 +338,7 @@ func runConvert(args []string, g *GlobalOptions) (int, error) {
 		return ExitParseError, err
 	}
 	if output != "" {
-		err = ioutil.WriteFile(output, []byte(outputStr), 0644)
+		err = os.WriteFile(output, []byte(outputStr), 0644)
 		if err != nil {
 			return ExitParseError, err
 		}
@@ -377,7 +376,7 @@ func runValidate(args []string, g *GlobalOptions) (int, error) {
 	if err != nil {
 		return ExitParseError, err
 	}
-	schemaContent, err := ioutil.ReadFile(schemaFile)
+	schemaContent, err := os.ReadFile(schemaFile)
 	if err != nil {
 		return ExitParseError, fmt.Errorf("cannot read schema: %v", err)
 	}
@@ -417,7 +416,7 @@ func printCrossReferences(refs map[string][]env.Reference) {
 }
 
 func loadAndParse(path string, g *GlobalOptions) (*model.Value, parser.Format, error) {
-	content, err := ioutil.ReadFile(path)
+	content, err := os.ReadFile(path)
 	if err != nil {
 		return nil, parser.FormatUnknown, fmt.Errorf("cannot read %s: %v", path, err)
 	}
@@ -440,7 +439,7 @@ func isDirectory(path string) bool {
 }
 
 func detectIndentSize(path string) int {
-	content, err := ioutil.ReadFile(path)
+	content, err := os.ReadFile(path)
 	if err != nil {
 		return 2
 	}
