@@ -1,0 +1,8 @@
+database:
+  host: ${DB_HOST}
+  port: 5432
+  name: myapp
+
+service:
+  name: ${SERVICE_NAME:-default}
+  url: http://${HOST}:${PORT}/api

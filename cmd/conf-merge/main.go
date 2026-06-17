@@ -1,4 +1,4 @@
-﻿package main
+﻿﻿package main
 
 import (
 	"conf-merge/pkg/color"
@@ -30,6 +30,8 @@ type GlobalOptions struct {
 	ArrayKeys    map[string]string
 	SortKeys     bool
 	OutputFormat parser.Format
+	Include      []string
+	Exclude      []string
 }
 
 func main() {
@@ -111,6 +113,28 @@ func parseGlobalOptions(args []string) (*GlobalOptions, []string) {
 				g.ArrayKeys[parts[0]] = parts[1]
 			}
 			i++
+		case strings.HasPrefix(arg, "--include="):
+			val := strings.TrimPrefix(arg, "--include=")
+			g.Include = append(g.Include, val)
+			i++
+		case arg == "--include":
+			if i+1 < len(args) {
+				g.Include = append(g.Include, args[i+1])
+				i += 2
+			} else {
+				i++
+			}
+		case strings.HasPrefix(arg, "--exclude="):
+			val := strings.TrimPrefix(arg, "--exclude=")
+			g.Exclude = append(g.Exclude, val)
+			i++
+		case arg == "--exclude":
+			if i+1 < len(args) {
+				g.Exclude = append(g.Exclude, args[i+1])
+				i += 2
+			} else {
+				i++
+			}
 		default:
 			remaining = append(remaining, arg)
 			i++
@@ -460,8 +484,14 @@ func detectIndentSize(path string) int {
 }
 
 func runBatchDiff(dirA, dirB string, g *GlobalOptions) (int, error) {
-	include := []string{"*.yaml", "*.yml", "*.json", "*.toml", "*.ini", "*.properties", ".env*", "*.env"}
-	exclude := []string{}
+	include := g.Include
+	if len(include) == 0 {
+		include = []string{"*.yaml", "*.yml", "*.json", "*.toml", "*.ini", "*.properties", ".env*", "*.env"}
+	}
+	exclude := g.Exclude
+	if exclude == nil {
+		exclude = []string{}
+	}
 	batchOpts := &BatchOptions{
 		Include: include,
 		Exclude: exclude,
@@ -540,6 +570,8 @@ GLOBAL OPTIONS:
   --no-expand-env           Disable $VAR and ${VAR} expansion
   -q, --quiet               Suppress all non-error output
   -v, --verbose             Enable detailed output
+  --include=<pattern>       Include files matching glob pattern (batch mode, repeatable)
+  --exclude=<pattern>       Exclude files matching glob pattern (batch mode, repeatable)
 
 EXIT CODES:
   0  Success, no conflicts

@@ -1,0 +1,18 @@
+users:
+  - name: Alice
+    age: 30
+    role: admin
+  - name: Bob
+    age: 25
+    role: user
+  - name: Charlie
+    age: 35
+    role: user
+    active: true
+
+servers:
+  - host: server1
+    port: 8080
+  - host: server2
+    port: 8081
+    status: healthy
