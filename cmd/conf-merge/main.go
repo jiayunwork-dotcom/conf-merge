@@ -1,4 +1,4 @@
-﻿package main
+﻿﻿package main
 
 import (
 	"conf-merge/pkg/changelog"
@@ -11,6 +11,7 @@ import (
 	"conf-merge/pkg/model"
 	"conf-merge/pkg/parser"
 	"conf-merge/pkg/schema"
+	templatepkg "conf-merge/pkg/template"
 	"conf-merge/pkg/writer"
 	"fmt"
 	"os"
@@ -25,6 +26,8 @@ const (
 	ExitDriftInfo   = 1
 	ExitDriftWarn   = 2
 	ExitDriftCrit   = 3
+	ExitTemplateWarn = 1
+	ExitTemplateErr  = 2
 )
 
 type GlobalOptions struct {
@@ -65,6 +68,12 @@ func main() {
 		exitCode, err = runHistory(remaining, globals)
 	case "drift":
 		exitCode, err = runDrift(remaining, globals)
+	case "render":
+		exitCode, err = runRender(remaining, globals)
+	case "template-diff":
+		exitCode, err = runTemplateDiff(remaining, globals)
+	case "template-validate":
+		exitCode, err = runTemplateValidate(remaining, globals)
 	case "-h", "--help", "help":
 		printUsage()
 		exitCode = ExitOK
@@ -597,6 +606,44 @@ COMMANDS:
              2  warning-level drift
              3  critical-level drift
 
+  render   <template-file> [-var <var-file>]... [-o output]
+           Render a template file with variables to generate final config.
+           Template syntax:
+             {{.var.path}}     - simple variable substitution
+             {{if .cond}}...{{end}}  - conditional block
+             {{range .arr}}...{{end}} - loop over array
+             In range body: {{.}} for current item, {{.field}} for item fields
+           Options:
+             -var <file>         Variable file (YAML/JSON/TOML), repeatable, later overrides earlier
+             -o, --output <file> Output file (default: stdout)
+           Exit codes:
+             0  success
+             2  parse/render error
+
+  template-diff <template-file> <name1>=<varfile1> <name2>=<varfile2>...
+                [--array-key=<path>=<key>]
+           Render template with multiple variable sets and show diff matrix.
+           Arguments:
+             template-file       The template file to render
+             name=varfile        Environment name and variable file pairs (at least 2)
+           Options:
+             --array-key=<path>=<key>  Array matching key for semantic diff
+           Output format: Matrix showing differences per environment pair,
+           grouped by key prefix (e.g. "database.*", "cache.*").
+           Exit codes:
+             0  no differences
+             1  has differences
+             2  parse/render error
+
+  template-validate <template-file> [-var <var-file>]...
+           Validate template syntax and check variable coverage.
+           Options:
+             -var <file>         Variable file for coverage check (repeatable)
+           Exit codes:
+             0  validation passed
+             1  syntax OK but missing variables
+             2  syntax errors
+
 GLOBAL OPTIONS:
   --format=<name>           Force input format (json/yaml/toml/ini/properties/env)
   --output-format=<name>    Force output format
@@ -1028,5 +1075,333 @@ func runDrift(args []string, g *GlobalOptions) (int, error) {
 			fmt.Print(result.FormatText(g.Verbose))
 		}
 	}
+	return result.ExitCode(), nil
+}
+
+func runRender(args []string, g *GlobalOptions) (int, error) {
+	if len(args) < 1 {
+		return ExitParseError, fmt.Errorf("render requires: <template-file> [-var <var-file>]... [-o output]")
+	}
+
+	templateFile := ""
+	varFiles := []string{}
+	output := ""
+	i := 0
+
+	for i < len(args) {
+		arg := args[i]
+		switch {
+		case arg == "-var":
+			if i+1 >= len(args) {
+				return ExitParseError, fmt.Errorf("-var requires a value")
+			}
+			varFiles = append(varFiles, args[i+1])
+			i += 2
+		case strings.HasPrefix(arg, "-var="):
+			varFiles = append(varFiles, strings.TrimPrefix(arg, "-var="))
+			i++
+		case arg == "-o" || arg == "--output":
+			if i+1 >= len(args) {
+				return ExitParseError, fmt.Errorf("-o requires a value")
+			}
+			output = args[i+1]
+			i += 2
+		case strings.HasPrefix(arg, "--output="):
+			output = strings.TrimPrefix(arg, "--output=")
+			i++
+		default:
+			if templateFile == "" {
+				templateFile = arg
+			}
+			i++
+		}
+	}
+
+	if templateFile == "" {
+		return ExitParseError, fmt.Errorf("render requires a template file")
+	}
+
+	templateContent, err := os.ReadFile(templateFile)
+	if err != nil {
+		return ExitParseError, fmt.Errorf("cannot read template %s: %v", templateFile, err)
+	}
+
+	tmpl, parseErrs := templatepkg.Parse(string(templateContent))
+	if len(parseErrs) > 0 {
+		for _, pe := range parseErrs {
+			fmt.Fprintf(os.Stderr, "  %s:%d:%d: %s\n", templateFile, pe.Line, pe.Column, pe.Message)
+		}
+		return ExitTemplateErr, fmt.Errorf("template has %d syntax error(s)", len(parseErrs))
+	}
+
+	var mergedVars *model.Value
+	if len(varFiles) > 0 {
+		vfList := []*templatepkg.VarFile{}
+		for _, vf := range varFiles {
+			v, _, err := loadAndParse(vf, g)
+			if err != nil {
+				return ExitParseError, err
+			}
+			vfList = append(vfList, &templatepkg.VarFile{Name: vf, Vars: v})
+		}
+		mergedVars, err = templatepkg.MergeVarFiles(vfList)
+		if err != nil {
+			return ExitParseError, err
+		}
+	} else {
+		mergedVars = model.NewMapValue()
+	}
+
+	result, err := tmpl.Render(mergedVars)
+	if err != nil {
+		return ExitTemplateErr, err
+	}
+
+	if output != "" {
+		err = os.WriteFile(output, []byte(result), 0644)
+		if err != nil {
+			return ExitParseError, fmt.Errorf("cannot write output %s: %v", output, err)
+		}
+		if !g.Quiet {
+			fmt.Printf("Rendered output written to %s\n", output)
+		}
+	} else {
+		fmt.Print(result)
+	}
+
+	return ExitOK, nil
+}
+
+func runTemplateDiff(args []string, g *GlobalOptions) (int, error) {
+	if len(args) < 3 {
+		return ExitParseError, fmt.Errorf("template-diff requires: <template-file> <name1>=<varfile1> <name2>=<varfile2>...")
+	}
+
+	templateFile := args[0]
+	envPairs := args[1:]
+
+	envs := make(map[string]string)
+	envOrder := []string{}
+	for _, pair := range envPairs {
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) != 2 {
+			return ExitParseError, fmt.Errorf("invalid environment pair: %s (expected name=varfile)", pair)
+		}
+		name, vfile := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		if name == "" || vfile == "" {
+			return ExitParseError, fmt.Errorf("invalid environment pair: %s", pair)
+		}
+		if _, exists := envs[name]; exists {
+			return ExitParseError, fmt.Errorf("duplicate environment name: %s", name)
+		}
+		envs[name] = vfile
+		envOrder = append(envOrder, name)
+	}
+
+	if len(envOrder) < 2 {
+		return ExitParseError, fmt.Errorf("template-diff requires at least 2 environments")
+	}
+
+	templateContent, err := os.ReadFile(templateFile)
+	if err != nil {
+		return ExitParseError, fmt.Errorf("cannot read template %s: %v", templateFile, err)
+	}
+
+	tmpl, parseErrs := templatepkg.Parse(string(templateContent))
+	if len(parseErrs) > 0 {
+		for _, pe := range parseErrs {
+			fmt.Fprintf(os.Stderr, "  %s:%d:%d: %s\n", templateFile, pe.Line, pe.Column, pe.Message)
+		}
+		return ExitTemplateErr, fmt.Errorf("template has %d syntax error(s)", len(parseErrs))
+	}
+
+	rendered := make(map[string]*model.Value)
+	renderedStr := make(map[string]string)
+	for _, name := range envOrder {
+		vfile := envs[name]
+		v, _, err := loadAndParse(vfile, g)
+		if err != nil {
+			return ExitParseError, fmt.Errorf("environment %s: %v", name, err)
+		}
+		vfList := []*templatepkg.VarFile{{Name: vfile, Vars: v}}
+		mergedVars, err := templatepkg.MergeVarFiles(vfList)
+		if err != nil {
+			return ExitParseError, fmt.Errorf("environment %s: %v", name, err)
+		}
+		result, err := tmpl.Render(mergedVars)
+		if err != nil {
+			return ExitTemplateErr, fmt.Errorf("environment %s: %v", name, err)
+		}
+		renderedStr[name] = result
+		parsed, _, err := parser.ParseFile(result, name+".yaml", parser.FormatYAML)
+		if err != nil {
+			return ExitParseError, fmt.Errorf("environment %s: cannot parse rendered output as YAML: %v", name, err)
+		}
+		rendered[name] = parsed
+	}
+
+	_ = renderedStr
+
+	hasDiff := false
+	opts := &diff.DiffOptions{ArrayKeyMap: g.ArrayKeys}
+
+	fmt.Println("=== Template Diff Matrix ===")
+	fmt.Println()
+
+	for i := 0; i < len(envOrder); i++ {
+		for j := i + 1; j < len(envOrder); j++ {
+			nameA, nameB := envOrder[i], envOrder[j]
+			dres := diff.ComputeDiff(rendered[nameA], rendered[nameB], opts)
+
+			if dres.HasDifferences() {
+				hasDiff = true
+			}
+
+			prefixCounts := make(map[string]int)
+			for _, item := range dres.Items {
+				prefix := getTopLevelPrefix(item.Path)
+				prefixCounts[prefix]++
+			}
+
+			fmt.Printf("%s vs %s: %d differences",
+				color.Bold(nameA), color.Bold(nameB), dres.Total)
+			if dres.Total > 0 {
+				fmt.Print(" (")
+				first := true
+				for prefix, count := range prefixCounts {
+					if !first {
+						fmt.Print(", ")
+					}
+					fmt.Printf("%d in %s.*", count, prefix)
+					first = false
+				}
+				fmt.Print(")")
+			}
+			fmt.Println()
+
+			if g.Verbose && dres.HasDifferences() {
+				fmt.Println(dres.Format(true))
+				fmt.Println()
+			}
+		}
+	}
+
+	if hasDiff {
+		return ExitHasConflict, nil
+	}
+	return ExitOK, nil
+}
+
+func getTopLevelPrefix(path string) string {
+	if path == "" {
+		return "root"
+	}
+	parts := strings.SplitN(path, ".", 2)
+	if len(parts) == 0 {
+		return "root"
+	}
+	first := parts[0]
+	if idx := strings.Index(first, "["); idx != -1 {
+		first = first[:idx]
+	}
+	if first == "" {
+		return "root"
+	}
+	return first
+}
+
+func runTemplateValidate(args []string, g *GlobalOptions) (int, error) {
+	if len(args) < 1 {
+		return ExitParseError, fmt.Errorf("template-validate requires: <template-file> [-var <var-file>]...")
+	}
+
+	templateFile := ""
+	varFiles := []string{}
+	i := 0
+
+	for i < len(args) {
+		arg := args[i]
+		switch {
+		case arg == "-var":
+			if i+1 >= len(args) {
+				return ExitParseError, fmt.Errorf("-var requires a value")
+			}
+			varFiles = append(varFiles, args[i+1])
+			i += 2
+		case strings.HasPrefix(arg, "-var="):
+			varFiles = append(varFiles, strings.TrimPrefix(arg, "-var="))
+			i++
+		default:
+			if templateFile == "" {
+				templateFile = arg
+			}
+			i++
+		}
+	}
+
+	if templateFile == "" {
+		return ExitParseError, fmt.Errorf("template-validate requires a template file")
+	}
+
+	templateContent, err := os.ReadFile(templateFile)
+	if err != nil {
+		return ExitParseError, fmt.Errorf("cannot read template %s: %v", templateFile, err)
+	}
+
+	tmpl, parseErrs := templatepkg.Parse(string(templateContent))
+	if len(parseErrs) > 0 {
+		if !g.Quiet {
+			fmt.Printf("Template has %d syntax error(s):\n", len(parseErrs))
+			for _, pe := range parseErrs {
+				fmt.Printf("  line %d, col %d: %s\n", pe.Line, pe.Column, pe.Message)
+			}
+		}
+		return ExitTemplateErr, nil
+	}
+
+	var mergedVars *model.Value
+	if len(varFiles) > 0 {
+		vfList := []*templatepkg.VarFile{}
+		for _, vf := range varFiles {
+			v, _, err := loadAndParse(vf, g)
+			if err != nil {
+				return ExitParseError, err
+			}
+			vfList = append(vfList, &templatepkg.VarFile{Name: vf, Vars: v})
+		}
+		mergedVars, err = templatepkg.MergeVarFiles(vfList)
+		if err != nil {
+			return ExitParseError, err
+		}
+	}
+
+	result := tmpl.Validate(mergedVars)
+
+	if !g.Quiet {
+		if result.HasSyntaxErrors() {
+			fmt.Printf("Template has %d syntax error(s):\n", len(result.SyntaxErrors))
+			for _, se := range result.SyntaxErrors {
+				fmt.Printf("  line %d, col %d: %s\n", se.Line, se.Column, se.Message)
+			}
+		} else if result.HasMissingVars() {
+			fmt.Printf("Syntax OK, but %d variable(s) not covered:\n", len(result.MissingVars))
+			for _, mv := range result.MissingVars {
+				fmt.Printf("  - %s\n", mv)
+			}
+		} else {
+			fmt.Println("Validation passed!")
+			if len(result.ReferencedVars) > 0 {
+				fmt.Printf("All %d referenced variable(s) are covered:\n", len(result.ReferencedVars))
+				seen := make(map[string]bool)
+				for _, rv := range result.ReferencedVars {
+					if !seen[rv] {
+						seen[rv] = true
+						fmt.Printf("  + %s\n", rv)
+					}
+				}
+			}
+		}
+	}
+
 	return result.ExitCode(), nil
 }

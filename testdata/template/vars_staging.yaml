@@ -1,0 +1,32 @@
+database:
+  host: staging-db.example.com
+  port: 3306
+  name: myapp_staging
+
+enable_ssl: true
+
+ssl:
+  cert_file: /etc/ssl/staging.crt
+  key_file: /etc/ssl/staging.key
+
+servers:
+  - name: web1
+    host: 10.0.1.10
+    port: 8080
+    backup: false
+  - name: web2
+    host: 10.0.1.11
+    port: 8080
+    backup: true
+  - name: web3
+    host: 10.0.1.12
+    port: 8080
+    backup: false
+
+cache:
+  type: redis
+  ttl: 600
+
+log:
+  level: info
+  file: /var/log/myapp/staging.log

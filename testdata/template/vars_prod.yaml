@@ -1,0 +1,36 @@
+database:
+  host: prod-db.example.com
+  port: 5432
+  name: myapp_prod
+
+enable_ssl: true
+
+ssl:
+  cert_file: /etc/ssl/prod.crt
+  key_file: /etc/ssl/prod.key
+
+servers:
+  - name: web1
+    host: 10.0.0.10
+    port: 80
+    backup: false
+  - name: web2
+    host: 10.0.0.11
+    port: 80
+    backup: true
+  - name: web3
+    host: 10.0.0.12
+    port: 80
+    backup: false
+  - name: web4
+    host: 10.0.0.13
+    port: 80
+    backup: true
+
+cache:
+  type: redis
+  ttl: 3600
+
+log:
+  level: warn
+  file: /var/log/myapp/prod.log

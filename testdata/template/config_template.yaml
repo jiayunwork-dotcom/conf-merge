@@ -1,0 +1,29 @@
+database:
+  host: {{.database.host}}
+  port: {{.database.port}}
+  name: {{.database.name}}
+
+{{if .enable_ssl}}
+ssl:
+  enabled: true
+  cert_file: {{.ssl.cert_file}}
+  key_file: {{.ssl.key_file}}
+{{end}}
+
+servers:
+{{range .servers}}
+  - name: {{.name}}
+    host: {{.host}}
+    port: {{.port}}
+{{if .backup}}
+    backup: true
+{{end}}
+{{end}}
+
+cache:
+  type: {{.cache.type}}
+  ttl: {{.cache.ttl}}
+
+log:
+  level: {{.log.level}}
+  file: {{.log.file}}
