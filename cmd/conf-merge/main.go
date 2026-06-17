@@ -1,4 +1,4 @@
-﻿﻿package main
+﻿﻿﻿package main
 
 import (
 	"conf-merge/pkg/color"

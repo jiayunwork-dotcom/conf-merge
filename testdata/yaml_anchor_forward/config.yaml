@@ -1,0 +1,16 @@
+services:
+  web:
+    database: *db-config
+    cache:
+      host: localhost
+      port: 6379
+
+db-config: &db-config
+  host: db.example.com
+  port: 5432
+  user: admin
+  password: secret
+
+app:
+  name: myapp
+  primary_db: *db-config

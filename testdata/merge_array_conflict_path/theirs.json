@@ -1,0 +1,9 @@
+{
+  "config": {
+    "items": [
+      {"id": 1, "name": "alpha", "value": "a"},
+      {"id": 2, "name": "beta", "value": "theirs-modified"},
+      {"id": 3, "name": "gamma", "value": "c"}
+    ]
+  }
+}
